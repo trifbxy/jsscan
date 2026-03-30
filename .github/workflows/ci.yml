@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: [3.9, '3.10', '3.11', '3.12']
+        python-version: ['3.9', '3.10', '3.11', '3.12']
 
     steps:
     - uses: actions/checkout@v3
@@ -38,12 +38,22 @@ jobs:
     - name: Test with sample data
       run: |
         mkdir -p test_js
-        # 创建示例 JS 文件
+        # 创建示例 JS 文件（包含已知敏感信息）
         echo "const apiKey='AIzaSyD-8L5kXqYzXp1A2B3C4D5E6F7G8H9I0J1K2L3M';" > test_js/sample.js
         echo "const password='admin123';" > test_js/sample2.js
-        # 运行扫描
-        python jsscan.py -d test_js --deep-scan --extract-api -o test_output.csv
-        # 检查输出文件是否存在
-        test -f test_output.csv || exit 1
-        test -f api_paths.txt || exit 1
+
+        # 运行扫描（使用 --scan-only 明确仅扫描本地目录）
+        python jsscan.py --scan-only -d test_js --deep-scan --extract-api -o test_output.csv
+
+        # 检查输出文件是否存在（CSV 和 API 路径文件）
+        test -f test_output.csv || { echo "CSV output missing"; exit 1; }
+        test -f results/api_paths.txt || { echo "API paths output missing"; exit 1; }
+
+        # 可选：验证 CSV 包含预期的泄露记录（基础验证）
+        # 这里仅确保文件非空
+        if [ ! -s test_output.csv ]; then
+          echo "CSV file is empty"
+          exit 1
+        fi
+
         echo "All tests passed"
