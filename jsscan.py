@@ -11,12 +11,12 @@ from urllib.parse import urlparse
 
 # ==================== 配置区 ====================
 DEFAULT_SCAN_DIR = "js_files"
-OUTPUT_CSV = "leak_results.csv"  # 统一 CSV 输出文件
+OUTPUT_CSV = "results/leak_results.csv"          # 统一 CSV 输出文件（默认放入 results 文件夹）
 SHOW_CONTEXT_LINES = 2
 DOWNLOAD_DELAY = 1
 SCAN_IO_DELAY = 2
 CURL_TIMEOUT = 30
-API_OUTPUT_FILE = "api_paths.txt"  # API 路径单独输出
+API_OUTPUT_FILE = "results/api_paths.txt"        # API 路径单独输出（默认放入 results 文件夹）
 
 # ==================== 正则模式（基础敏感信息） ====================
 BASE_PATTERNS = {
@@ -162,6 +162,11 @@ def scan_file(filepath, deep_scan=False, extract_api=False):
 
 def save_results_to_csv(all_findings, all_extra, output_csv):
     """将所有泄露（基础+扩展）保存到一个 CSV 文件"""
+    # 确保输出目录存在
+    output_dir = os.path.dirname(output_csv)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     with open(output_csv, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['File', 'Type', 'Matched Text', 'Line', 'Context'])
@@ -230,6 +235,12 @@ def fetch_js_files(urls_file, target_dir, delay=1, base_url=None):
 
 
 def save_api_paths(all_api_paths, output_file):
+    """保存 API 路径列表到文件"""
+    # 确保输出目录存在
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     unique_paths = sorted(set(all_api_paths))
     with open(output_file, 'w', encoding='utf-8') as f:
         for path in unique_paths:
