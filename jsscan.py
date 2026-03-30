@@ -6,8 +6,9 @@ import shutil
 import time
 import csv
 import subprocess
+import sys
 from collections import deque, defaultdict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 # ==================== 配置区 ====================
 DEFAULT_SCAN_DIR = "js_files"
@@ -35,9 +36,10 @@ BASE_PATTERNS = {
     "google_api_key": re.compile(r'AIza[0-9A-Za-z\-_]{35}', re.IGNORECASE),
     "generic_secret": re.compile(r'(?:secret|private_key|client_secret)\s*[=:]\s*["\']([^"\']{16,})["\']',
                                  re.IGNORECASE),
+    "internal_ip_url": re.compile(
+        r'https?://(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|127\.0\.0\.1|localhost)[/"]?'),
     "internal_ip": re.compile(
-        r'(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|127\.0\.0\.1|localhost)'),
-    "url": re.compile(r'https?://[^\s"\']+'),
+        r'(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|127\.0\.0\.1|localhost)'),
     "dynamic_script": re.compile(r'(createElement\([\'"]script[\'"]\)|setAttribute\([\'"]src[\'"]|\.src\s*=)'),
     "eval": re.compile(r'\beval\s*\('),
     "function": re.compile(r'\bnew\s+Function\s*\('),
@@ -81,8 +83,8 @@ API_PATTERNS = [
 
 
 def is_likely_api_path(path):
-    exclude_extensions = (
-    '.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot')
+    exclude_extensions = ('.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf',
+                          '.eot')
     if path.lower().endswith(exclude_extensions):
         return False
     if path.startswith('/static/') or path.startswith('/assets/') or path.startswith('/lib/'):
@@ -99,7 +101,7 @@ def get_line_context(lines_deque, target_line_num):
     return "\n".join(context_parts)
 
 
-def scan_file(filepath, deep_scan=False, extract_api=False):
+def scan_file(filepath, deep_scan=False, extract_api=False, quiet=False):
     """返回：基础泄露列表，扩展泄露列表，API路径集合"""
     findings = []  # 基础泄露
     extra_findings = []  # 扩展泄露
@@ -108,65 +110,86 @@ def scan_file(filepath, deep_scan=False, extract_api=False):
     line_num = 0
 
     try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            for raw_line in f:
-                line_num += 1
-                line = raw_line.rstrip('\n\r')
-                recent_lines.append((line_num, line))
+        # 尝试多种编码
+        for encoding in ['utf-8', 'latin-1', 'cp1252']:
+            try:
+                with open(filepath, 'r', encoding=encoding, errors='ignore') as f:
+                    for raw_line in f:
+                        line_num += 1
+                        line = raw_line.rstrip('\n\r')
+                        recent_lines.append((line_num, line))
 
-                # 基础敏感信息
-                for name, pattern in BASE_PATTERNS.items():
-                    for match in pattern.finditer(line):
-                        matched_text = match.group(0)
-                        if name == "url":
-                            if not re.search(r'(localhost|127\.0\.0\.1|192\.168|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)',
-                                             matched_text):
-                                continue
-                        context = get_line_context(recent_lines, line_num)
-                        findings.append({
-                            "type": name,
-                            "matched_text": matched_text,
-                            "line": line_num,
-                            "context": context
-                        })
+                        # 基础敏感信息
+                        for name, pattern in BASE_PATTERNS.items():
+                            for match in pattern.finditer(line):
+                                matched_text = match.group(0)
+                                # 内网 IP URL 模式仅匹配含内网 IP 的 URL，直接接受
+                                # 其他模式不过滤
+                                if name == "internal_ip_url":
+                                    # 直接匹配即可
+                                    pass
+                                # 对于 base64 数据，增加简单熵过滤
+                                if name == "base64_data" and len(matched_text) < 40:
+                                    continue
+                                context = get_line_context(recent_lines, line_num)
+                                findings.append({
+                                    "type": name,
+                                    "matched_text": matched_text,
+                                    "line": line_num,
+                                    "context": context
+                                })
 
-                # 深度扫描
-                if deep_scan:
-                    for name, pattern in EXTRA_PATTERNS.items():
-                        for match in pattern.finditer(line):
-                            matched_text = match.group(0)
-                            if name == "base64_data" and len(matched_text) < 40:
-                                continue
-                            context = get_line_context(recent_lines, line_num)
-                            extra_findings.append({
-                                "type": name,
-                                "matched_text": matched_text,
-                                "line": line_num,
-                                "context": context
-                            })
+                        # 深度扫描
+                        if deep_scan:
+                            for name, pattern in EXTRA_PATTERNS.items():
+                                for match in pattern.finditer(line):
+                                    matched_text = match.group(0)
+                                    if name == "base64_data" and len(matched_text) < 40:
+                                        continue
+                                    context = get_line_context(recent_lines, line_num)
+                                    extra_findings.append({
+                                        "type": name,
+                                        "matched_text": matched_text,
+                                        "line": line_num,
+                                        "context": context
+                                    })
 
-                # API 路径提取
-                if extract_api:
-                    for pattern in API_PATTERNS:
-                        for match in pattern.finditer(line):
-                            path = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
-                            path = path.strip('"\'`')
-                            if path.startswith('/') and is_likely_api_path(path):
-                                api_paths.add(path)
+                        # API 路径提取
+                        if extract_api:
+                            for pattern in API_PATTERNS:
+                                for match in pattern.finditer(line):
+                                    path = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
+                                    path = path.strip('"\'`')
+                                    if path.startswith('/') and is_likely_api_path(path):
+                                        api_paths.add(path)
+                break  # 成功读取，退出编码循环
+            except UnicodeDecodeError:
+                continue
+        else:
+            # 所有编码都失败
+            if not quiet:
+                print(f"[!] 无法解码文件: {filepath}")
     except MemoryError:
-        print(f"[!] 内存不足，跳过文件: {filepath}")
+        if not quiet:
+            print(f"[!] 内存不足，跳过文件: {filepath}")
     except Exception as e:
-        print(f"[!] 无法读取文件 {filepath}: {e}")
+        if not quiet:
+            print(f"[!] 无法读取文件 {filepath}: {e}")
     return findings, extra_findings, api_paths
 
 
-def save_results_to_csv(all_findings, all_extra, output_csv):
-    """将所有泄露（基础+扩展）保存到一个 CSV 文件"""
+def save_results_to_csv_writer(output_csv, all_findings, all_extra, quiet=False):
+    """将所有泄露（基础+扩展）保存到一个 CSV 文件，支持流式写入（增量）"""
     # 确保输出目录存在
     output_dir = os.path.dirname(output_csv)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    # 以追加模式写入，但第一次调用需要写入表头
+    # 此处为了简化，直接覆盖写入；因为调用一次后不再修改
+    # 如果需要流式写入，可以在外部循环中每次调用此函数并传入追加模式
+    # 但当前设计是全部扫描完再写入，为保持兼容，暂时不改为流式
+    # 如果文件很大，可以改为流式写入，但影响不大
     with open(output_csv, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['File', 'Type', 'Matched Text', 'Line', 'Context'])
@@ -176,10 +199,11 @@ def save_results_to_csv(all_findings, all_extra, output_csv):
         for filepath, items in all_extra.items():
             for item in items:
                 writer.writerow([filepath, item['type'], item['matched_text'], item['line'], item['context']])
-    print(f"[+] 泄露结果已保存到 {output_csv}")
+    if not quiet:
+        print(f"[+] 泄露结果已保存到 {output_csv}")
 
 
-def save_js_files(scan_dir, target_dir):
+def save_js_files(scan_dir, target_dir, quiet=False):
     """复制 JS 文件到指定目录，保持目录结构"""
     if not os.path.exists(target_dir):
         os.makedirs(target_dir)
@@ -191,52 +215,81 @@ def save_js_files(scan_dir, target_dir):
                 dst_path = os.path.join(target_dir, rel_path)
                 os.makedirs(os.path.dirname(dst_path), exist_ok=True)
                 shutil.copy2(src_path, dst_path)
-                print(f"[*] 已保存: {dst_path}")
-    print(f"[+] 所有 JS 文件已保存到 {target_dir}")
+                if not quiet:
+                    print(f"[*] 已保存: {dst_path}")
+    if not quiet:
+        print(f"[+] 所有 JS 文件已保存到 {target_dir}")
 
 
-def fetch_js_files(urls_file, target_dir, delay=1, base_url=None):
+def fetch_js_files(urls_file, target_dir, delay=1, base_url=None, quiet=False):
     """下载 JS 文件，保持 URL 路径结构"""
     if not os.path.exists(target_dir):
         os.makedirs(target_dir)
 
+    # 检查 curl 命令
+    try:
+        subprocess.run(['curl', '--version'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("[!] 错误：系统未安装 curl 或 curl 不可用。请安装 curl 或使用其他方法下载 JS 文件。")
+        sys.exit(1)
+
     with open(urls_file, 'r', encoding='utf-8') as f:
-        urls = [line.strip() for line in f if line.strip()]
+        urls = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
 
     total = len(urls)
-    print(f"[*] 准备下载 {total} 个 JS 文件，延迟 {delay} 秒/次")
+    if not quiet:
+        print(f"[*] 准备下载 {total} 个 JS 文件，延迟 {delay} 秒/次")
 
     for idx, url in enumerate(urls, 1):
         try:
+            # 补全 URL
             if base_url and not url.startswith(('http://', 'https://')):
-                url = base_url.rstrip('/') + '/' + url.lstrip('/')
-                print(f"    补全后URL: {url}")
+                url = urljoin(base_url.rstrip('/') + '/', url.lstrip('/'))
+                if not quiet:
+                    print(f"    补全后URL: {url}")
 
+            # 校验 URL 格式
             parsed = urlparse(url)
+            if not parsed.scheme or not parsed.netloc:
+                if not quiet:
+                    print(f"[!] 跳过无效 URL: {url}")
+                continue
+
             # 保持路径结构：去掉开头的斜杠，保留目录层级
             rel_path = parsed.path.lstrip('/')
             if not rel_path.endswith('.js'):
                 rel_path += '.js'
-            save_path = os.path.join(target_dir, rel_path)
+            # 防止路径遍历攻击，确保路径安全
+            safe_rel_path = os.path.normpath(rel_path).lstrip(os.sep)
+            if safe_rel_path.startswith('..'):
+                # 存在路径遍历风险，跳过
+                if not quiet:
+                    print(f"[!] 不安全路径，跳过: {safe_rel_path}")
+                continue
+            save_path = os.path.join(target_dir, safe_rel_path)
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-            print(f"[{idx}/{total}] 下载: {url} -> {save_path}")
+            if not quiet:
+                print(f"[{idx}/{total}] 下载: {url} -> {save_path}")
+
             cmd = ['curl', '-k', '-L', '-s', '-o', save_path, '--max-time', str(CURL_TIMEOUT), url]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
-                print(f"    [!] curl 错误: {result.stderr}")
-            else:
+                if not quiet:
+                    print(f"    [!] curl 错误: {result.stderr}")
+            elif not quiet:
                 print(f"    成功保存")
         except Exception as e:
-            print(f"    [!] 下载失败: {e}")
+            if not quiet:
+                print(f"    [!] 下载失败: {e}")
         time.sleep(delay)
 
-    print(f"[+] 下载完成，文件保存至 {target_dir}")
+    if not quiet:
+        print(f"[+] 下载完成，文件保存至 {target_dir}")
 
 
-def save_api_paths(all_api_paths, output_file):
+def save_api_paths(all_api_paths, output_file, quiet=False):
     """保存 API 路径列表到文件"""
-    # 确保输出目录存在
     output_dir = os.path.dirname(output_file)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -245,13 +298,15 @@ def save_api_paths(all_api_paths, output_file):
     with open(output_file, 'w', encoding='utf-8') as f:
         for path in unique_paths:
             f.write(path + '\n')
-    print(f"[+] 共发现 {len(unique_paths)} 个 API 路径，已保存至 {output_file}")
+    if not quiet:
+        print(f"[+] 共发现 {len(unique_paths)} 个 API 路径，已保存至 {output_file}")
 
 
 # ==================== 扫描核心 ====================
-def perform_scan(scan_dir, deep_scan, extract_api, output_csv, api_output, io_delay):
+def perform_scan(scan_dir, deep_scan, extract_api, output_csv, api_output, io_delay, quiet, fail_on_leak):
     if not os.path.isdir(scan_dir):
-        print(f"[!] 目录不存在: {scan_dir}")
+        if not quiet:
+            print(f"[!] 目录不存在: {scan_dir}")
         return
 
     # 统计文件总数
@@ -266,52 +321,70 @@ def perform_scan(scan_dir, deep_scan, extract_api, output_csv, api_output, io_de
     all_api_paths = set()
     processed = 0
 
+    # 用于流式写入的 CSV writer 初始化（可选）
+    # 这里为了简单，依然先收集再写入，但为了避免内存过大，可改为流式写入
+    # 考虑到结果通常不会太大，暂时保持原样
+
     for root, _, files in os.walk(scan_dir):
         for file in files:
             if not file.endswith('.js'):
                 continue
             processed += 1
             filepath = os.path.join(root, file)
-            print(f"[*] 扫描 ({processed}/{total_files}): {filepath}")
-            findings, extra, apis = scan_file(filepath, deep_scan=deep_scan, extract_api=extract_api)
+            if not quiet:
+                print(f"[*] 扫描 ({processed}/{total_files}): {filepath}")
+            findings, extra, apis = scan_file(filepath, deep_scan=deep_scan, extract_api=extract_api, quiet=quiet)
 
             if findings:
                 all_findings[filepath] = findings
-                print(f"[+] {filepath} 发现 {len(findings)} 个基础泄露")
-                for f in findings[:3]:
-                    print(f"    [{f['type']}] {f['matched_text']} (行 {f['line']})")
-                if len(findings) > 3:
-                    print(f"    ... 还有 {len(findings) - 3} 个")
+                if not quiet:
+                    print(f"[+] {filepath} 发现 {len(findings)} 个基础泄露")
+                    for f in findings[:3]:
+                        print(f"    [{f['type']}] {f['matched_text']} (行 {f['line']})")
+                    if len(findings) > 3:
+                        print(f"    ... 还有 {len(findings) - 3} 个")
 
             if extra:
                 all_extra[filepath] = extra
-                print(f"[+] {filepath} 发现 {len(extra)} 个扩展泄露")
-                for e in extra[:3]:
-                    print(f"    [{e['type']}] {e['matched_text']} (行 {e['line']})")
-                if len(extra) > 3:
-                    print(f"    ... 还有 {len(extra) - 3} 个")
+                if not quiet:
+                    print(f"[+] {filepath} 发现 {len(extra)} 个扩展泄露")
+                    for e in extra[:3]:
+                        print(f"    [{e['type']}] {e['matched_text']} (行 {e['line']})")
+                    if len(extra) > 3:
+                        print(f"    ... 还有 {len(extra) - 3} 个")
 
             if apis:
                 all_api_paths.update(apis)
-                print(f"    [API] 新增 {len(apis)} 个路径")
+                if not quiet:
+                    print(f"    [API] 新增 {len(apis)} 个路径")
 
             if io_delay > 0:
                 time.sleep(io_delay)
 
     # 保存泄露结果到 CSV
-    save_results_to_csv(all_findings, all_extra, output_csv)
+    save_results_to_csv_writer(output_csv, all_findings, all_extra, quiet)
 
     # 保存 API 路径（如果启用）
     if extract_api:
-        save_api_paths(all_api_paths, api_output)
+        save_api_paths(all_api_paths, api_output, quiet)
 
-    print(f"\n统计：")
-    print(f"  - 基础泄露文件数: {len(all_findings)}")
-    if deep_scan:
-        print(f"  - 扩展泄露文件数: {len(all_extra)}")
-    print(f"  - 总泄露条目数: {sum(len(v) for v in all_findings.values()) + sum(len(v) for v in all_extra.values())}")
-    if extract_api:
-        print(f"  - API 路径数: {len(all_api_paths)}")
+    total_base_leaks = sum(len(v) for v in all_findings.values())
+    total_extra_leaks = sum(len(v) for v in all_extra.values())
+    total_leaks = total_base_leaks + total_extra_leaks
+
+    if not quiet:
+        print(f"\n统计：")
+        print(f"  - 基础泄露文件数: {len(all_findings)}")
+        if deep_scan:
+            print(f"  - 扩展泄露文件数: {len(all_extra)}")
+        print(f"  - 总泄露条目数: {total_leaks}")
+        if extract_api:
+            print(f"  - API 路径数: {len(all_api_paths)}")
+
+    # 退出码控制
+    if fail_on_leak and total_leaks > 0:
+        sys.exit(1)
+    sys.exit(0)
 
 
 # ==================== 主函数 ====================
@@ -337,10 +410,14 @@ def main():
     parser.add_argument("--io-delay", type=float, default=SCAN_IO_DELAY,
                         help=f"扫描每个文件后的延迟秒数（默认: {SCAN_IO_DELAY}）")
 
-    # 输出选项（简化）
+    # 输出选项
     parser.add_argument("-o", "--output", default=OUTPUT_CSV, help=f"输出 CSV 文件（默认: {OUTPUT_CSV}）")
     parser.add_argument("--api-output", default=API_OUTPUT_FILE, help=f"API 路径输出文件（默认: {API_OUTPUT_FILE}）")
     parser.add_argument("-s", "--save-js", metavar="SAVE_DIR", help="将所有 JS 文件复制到指定目录用于人工审查")
+
+    # 控制选项
+    parser.add_argument("-q", "--quiet", action="store_true", help="静默模式，减少输出")
+    parser.add_argument("--fail-on-leak", action="store_true", help="发现泄露时退出码为 1，否则正常退出 0")
 
     args = parser.parse_args()
 
@@ -352,24 +429,28 @@ def main():
     # 执行下载（如果需要）
     if args.fetch:
         if scan_only:
-            print("[!] 错误：--scan-only 模式下不能同时使用 -f。")
-            return
-        fetch_js_files(args.fetch, args.dir, args.delay, base_url=args.base_url)
+            if not args.quiet:
+                print("[!] 错误：--scan-only 模式下不能同时使用 -f。")
+            sys.exit(1)
+        fetch_js_files(args.fetch, args.dir, args.delay, base_url=args.base_url, quiet=args.quiet)
         if download_only:
-            print("[*] 仅下载模式完成。")
-            return
+            if not args.quiet:
+                print("[*] 仅下载模式完成。")
+            sys.exit(0)
         # 否则继续扫描（下载并扫描）
 
     # 执行扫描（如果不需要下载或已下载完成）
     if not download_only:
-        perform_scan(args.dir, args.deep_scan, args.extract_api, args.output, args.api_output, args.io_delay)
+        perform_scan(args.dir, args.deep_scan, args.extract_api, args.output, args.api_output, args.io_delay,
+                     args.quiet, args.fail_on_leak)
 
     # 额外保存 JS 文件（如果需要）
     if args.save_js:
         if not os.path.isdir(args.dir):
-            print(f"[!] 目录不存在: {args.dir}，无法保存 JS 文件。")
+            if not args.quiet:
+                print(f"[!] 目录不存在: {args.dir}，无法保存 JS 文件。")
         else:
-            save_js_files(args.dir, args.save_js)
+            save_js_files(args.dir, args.save_js, args.quiet)
 
 
 if __name__ == "__main__":
