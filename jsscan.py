@@ -321,10 +321,6 @@ def perform_scan(scan_dir, deep_scan, extract_api, output_csv, api_output, io_de
     all_api_paths = set()
     processed = 0
 
-    # 用于流式写入的 CSV writer 初始化（可选）
-    # 这里为了简单，依然先收集再写入，但为了避免内存过大，可改为流式写入
-    # 考虑到结果通常不会太大，暂时保持原样
-
     for root, _, files in os.walk(scan_dir):
         for file in files:
             if not file.endswith('.js'):
@@ -381,10 +377,11 @@ def perform_scan(scan_dir, deep_scan, extract_api, output_csv, api_output, io_de
         if extract_api:
             print(f"  - API 路径数: {len(all_api_paths)}")
 
-    # 退出码控制
+    # 退出码控制：默认退出0，除非启用 fail_on_leak 且存在泄露
     if fail_on_leak and total_leaks > 0:
         sys.exit(1)
-    sys.exit(0)
+    else:
+        sys.exit(0)
 
 
 # ==================== 主函数 ====================
@@ -417,14 +414,14 @@ def main():
 
     # 控制选项
     parser.add_argument("-q", "--quiet", action="store_true", help="静默模式，减少输出")
-    parser.add_argument("--fail-on-leak", action="store_true", help="发现泄露时退出码为 1，否则正常退出 0")
+    parser.add_argument("--fail-on-leak", action="store_true",
+                        help="发现泄露时退出码为 1（默认退出码为 0）")
 
     args = parser.parse_args()
 
     # 确定操作模式
     download_only = args.download_only
     scan_only = args.scan_only
-    fetch_and_scan = (args.fetch is not None) and not download_only
 
     # 执行下载（如果需要）
     if args.fetch:
