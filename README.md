@@ -1,4 +1,4 @@
-# JSScan
+# jsscan
 
 一个用于扫描 JavaScript 文件中敏感信息泄露的 Python 工具。支持本地扫描、远程下载、深度检测、API 路径提取等功能，结果输出为 CSV 文件，便于分析和审计。
 
